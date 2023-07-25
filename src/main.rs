@@ -1,3 +1,8 @@
+mod devenum;
+
 fn main() {
-    println!("Hello, world!");
+    let controllers = devenum::game_controllers().unwrap();
+    for item in controllers {
+        println!("{:?}", item);
+    }
 }
