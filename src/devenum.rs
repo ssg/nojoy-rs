@@ -19,7 +19,7 @@ use windows::{
             },
             HumanInterfaceDevice::HidD_GetHidGuid,
         },
-        Foundation::{GetLastError, ERROR_INSUFFICIENT_BUFFER, HWND, WIN32_ERROR},
+        Foundation::{ERROR_INSUFFICIENT_BUFFER, HWND},
     },
 };
 
@@ -31,6 +31,18 @@ pub enum GameControllerStatus {
 }
 
 #[derive(Debug, Clone)]
+pub enum Error {
+    Win32(windows::core::Error),
+    ConfigRet(CONFIGRET),
+}
+
+impl From<windows::core::Error> for Error {
+    fn from(err: windows::core::Error) -> Error {
+        Error::Win32(err)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct GameController {
     pub manufacturer: String,
     pub name: String,
@@ -39,31 +51,15 @@ pub struct GameController {
     pub disableable: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum Error {
-    Win32(WIN32_ERROR),
-    ConfigRet(CONFIGRET),
-}
-
-impl Error {
-    fn from_win32() -> Self {
-        Self::Win32(unsafe { GetLastError() })
-    }
-
-    fn from_configret(cr: CONFIGRET) -> Self {
-        Self::ConfigRet(cr)
-    }
-}
-
 impl GameController {
     /// Try to create an instance of GameController out of given devinfo data.
     pub unsafe fn try_from_devinfo(
         devinfo: HDEVINFO,
         devinfo_data: &SP_DEVINFO_DATA,
     ) -> Result<Self, Error> {
-        let name = device_prop_sz(devinfo, &devinfo_data, SPDRP_DEVICEDESC)?;
-        let manufacturer = device_prop_sz(devinfo, &devinfo_data, SPDRP_MFG)?;
-        let instance_id = device_instance_id(devinfo, &devinfo_data)?;
+        let name = device_prop_sz(devinfo, devinfo_data, SPDRP_DEVICEDESC)?;
+        let manufacturer = device_prop_sz(devinfo, devinfo_data, SPDRP_MFG)?;
+        let instance_id = device_instance_id(devinfo, devinfo_data)?;
         let flags = device_status_flags(devinfo_data.DevInst)?;
         let status = match flags {
             0 => GameControllerStatus::Disconnected,
@@ -90,7 +86,7 @@ pub fn game_controllers() -> Result<Vec<GameController>, Error> {
     unsafe {
         let devinfo = dev_info(HidD_GetHidGuid())?;
         let mut index = 0;
-        while SetupDiEnumDeviceInfo(devinfo, index, &mut devinfo_data).as_bool() {
+        while SetupDiEnumDeviceInfo(devinfo, index, &mut devinfo_data).is_ok() {
             index += 1;
 
             let hwids = device_prop_multi_sz(devinfo, &devinfo_data, SPDRP_HARDWAREID)?;
@@ -103,7 +99,7 @@ pub fn game_controllers() -> Result<Vec<GameController>, Error> {
         }
 
         // must do this at the end
-        SetupDiDestroyDeviceInfoList(devinfo);
+        SetupDiDestroyDeviceInfoList(devinfo)?;
     }
     Ok(result)
 }
@@ -114,16 +110,13 @@ fn is_game_controller(hwids: Vec<String>) -> bool {
     hwids.iter().any(|s| s == GAME_CONTROLLER_HARDWARE_ID)
 }
 
-unsafe fn dev_info(guid: windows::core::GUID) -> Result<HDEVINFO, Error> {
-    let Ok(devinfo) = SetupDiGetClassDevsA(
+unsafe fn dev_info(guid: windows::core::GUID) -> Result<HDEVINFO, windows::core::Error> {
+    SetupDiGetClassDevsA(
         Some(&guid),
         PCSTR::null(),
         HWND::default(),
         DIGCF_DEVICEINTERFACE,
-    ) else {
-        return Err(Error::from_win32());
-    };
-    Ok(devinfo)
+    )
 }
 
 unsafe fn device_status_flags(devinst: u32) -> Result<u32, Error> {
@@ -134,7 +127,7 @@ unsafe fn device_status_flags(devinst: u32) -> Result<u32, Error> {
     match result {
         CR_SUCCESS => Ok(flags),
         CR_NO_SUCH_DEVNODE => Ok(0),
-        x => Err(Error::from_configret(x)),
+        x => Err(Error::ConfigRet(x)),
     }
 }
 
@@ -144,17 +137,15 @@ unsafe fn device_instance_id(
 ) -> Result<String, Error> {
     let mut req_size = 0;
 
-    // measure the size first
-    if !SetupDiGetDeviceInstanceIdA(devinfo, devinfo_data, None, Some(&mut req_size)).as_bool() {
-        assert_insufficient_buffer()?;
-    }
+    assert_insufficient_buffer(SetupDiGetDeviceInstanceIdA(
+        devinfo,
+        devinfo_data,
+        None,
+        Some(&mut req_size),
+    ))?;
 
     let mut buf = vec![0u8; req_size as usize];
-    if !SetupDiGetDeviceInstanceIdA(devinfo, devinfo_data, Some(&mut buf), Some(&mut req_size))
-        .as_bool()
-    {
-        return Err(Error::from_win32());
-    }
+    SetupDiGetDeviceInstanceIdA(devinfo, devinfo_data, Some(&mut buf), Some(&mut req_size))?;
 
     Ok(CString::from_vec_with_nul(buf)
         .unwrap()
@@ -171,11 +162,7 @@ unsafe fn device_prop_sz(
 
     // get the contents
     let mut buf = vec![0u8; buflen as usize];
-    if !SetupDiGetDeviceRegistryPropertyW(devinfo, devinfo_data, prop, None, Some(&mut buf), None)
-        .as_bool()
-    {
-        return Err(Error::from_win32());
-    }
+    SetupDiGetDeviceRegistryPropertyW(devinfo, devinfo_data, prop, None, Some(&mut buf), None)?;
     Ok(from_utf16_in_u8(&buf))
 }
 
@@ -188,11 +175,7 @@ unsafe fn device_prop_multi_sz(
 
     // get the contents
     let mut buf = vec![0u8; buflen as usize];
-    if !SetupDiGetDeviceRegistryPropertyW(devinfo, devinfo_data, prop, None, Some(&mut buf), None)
-        .as_bool()
-    {
-        return Err(Error::from_win32());
-    }
+    SetupDiGetDeviceRegistryPropertyW(devinfo, devinfo_data, prop, None, Some(&mut buf), None)?;
     Ok(multi_sz_from_utf16_in_u8(&buf))
 }
 
@@ -202,32 +185,29 @@ unsafe fn prop_bufsize(
     prop: u32,
 ) -> Result<u32, Error> {
     let mut buflen = 0;
-    // query buffer needed first
-    if !SetupDiGetDeviceRegistryPropertyW(
+    // query buffer needed first - must return error
+    assert_insufficient_buffer(SetupDiGetDeviceRegistryPropertyW(
         devinfo,
         devinfo_data,
         prop,
         None,
         None,
         Some(&mut buflen),
-    )
-    .as_bool()
-    {
-        assert_insufficient_buffer()?;
-    }
+    ))?;
     Ok(buflen)
 }
 
 /// Make sure the last result is "ERROR_INSUFFICIENT_BUFFER" because
 /// it actually denotes success for when you need to get "required size" value
 /// in SetupDi calls. (CM_xx doesn't need this behavior)
-unsafe fn assert_insufficient_buffer() -> Result<(), Error> {
-    let err = GetLastError();
-    if err != ERROR_INSUFFICIENT_BUFFER {
+unsafe fn assert_insufficient_buffer(result: windows::core::Result<()>) -> Result<(), Error> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(x) if x.code() == ERROR_INSUFFICIENT_BUFFER.into() => Ok(()),
+
         // ERROR_INVALID_DATA means the property doesn't exist
-        return Err(Error::Win32(err));
+        Err(y) => Err(Error::Win32(y)),
     }
-    Ok(())
 }
 
 /// Cast a &[u8] to &[u16] according to where it's null terminator is positioned.
