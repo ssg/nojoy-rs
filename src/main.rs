@@ -10,6 +10,10 @@ pub enum Message {
 
 fn main() {
     let controllers = game_controllers().unwrap();
+    if controllers.is_empty() {
+        println!("No controllers found");
+        return;
+    }
     for item in controllers {
         println!("{:?}", item);
     }
