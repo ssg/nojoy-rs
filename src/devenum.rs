@@ -11,11 +11,7 @@ use windows::{
     Win32::{
         Devices::{
             DeviceAndDriverInstallation::{
-                CM_Get_DevNode_Status, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
-                SetupDiGetClassDevsA, SetupDiGetDeviceInstanceIdA,
-                SetupDiGetDeviceRegistryPropertyW, CONFIGRET, CR_NO_SUCH_DEVNODE, CR_SUCCESS,
-                DIGCF_DEVICEINTERFACE, DN_DISABLEABLE, DN_STARTED, HDEVINFO, SPDRP_DEVICEDESC,
-                SPDRP_HARDWAREID, SPDRP_MFG, SP_DEVINFO_DATA,
+                CM_Get_DevNode_Status, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsA, SetupDiGetDeviceInstanceIdA, SetupDiGetDeviceRegistryPropertyW, CM_DEVNODE_STATUS_FLAGS, CM_PROB, CONFIGRET, CR_NO_SUCH_DEVNODE, CR_SUCCESS, DIGCF_DEVICEINTERFACE, DN_DISABLEABLE, DN_STARTED, HDEVINFO, SETUP_DI_REGISTRY_PROPERTY, SPDRP_DEVICEDESC, SPDRP_HARDWAREID, SPDRP_MFG, SP_DEVINFO_DATA
             },
             HumanInterfaceDevice::HidD_GetHidGuid,
         },
@@ -62,8 +58,8 @@ impl GameController {
         let instance_id = device_instance_id(devinfo, devinfo_data)?;
         let flags = device_status_flags(devinfo_data.DevInst)?;
         let status = match flags {
-            0 => GameControllerStatus::Disconnected,
-            x if x & DN_STARTED == 0 => GameControllerStatus::Disabled,
+            CM_DEVNODE_STATUS_FLAGS(0) => GameControllerStatus::Disconnected,
+            x if (x & DN_STARTED).0 == 0 => GameControllerStatus::Disabled,
             _ => GameControllerStatus::Enabled,
         };
         Ok(Self {
@@ -71,7 +67,7 @@ impl GameController {
             name,
             instance_id,
             status,
-            disableable: flags & DN_DISABLEABLE != 0,
+            disableable: (flags & DN_DISABLEABLE).0 != 0,
         })
     }
 }
@@ -119,14 +115,14 @@ unsafe fn dev_info(guid: windows::core::GUID) -> Result<HDEVINFO, windows::core:
     )
 }
 
-unsafe fn device_status_flags(devinst: u32) -> Result<u32, Error> {
-    let mut flags: u32 = 0;
-    let mut problem: u32 = 0;
+unsafe fn device_status_flags(devinst: u32) -> Result<CM_DEVNODE_STATUS_FLAGS, Error> {
+    let mut flags: CM_DEVNODE_STATUS_FLAGS = CM_DEVNODE_STATUS_FLAGS(0);
+    let mut problem: CM_PROB = CM_PROB(0);
     let result =
         CM_Get_DevNode_Status(&mut flags, &mut problem, devinst, 0 /* must be zero */);
     match result {
         CR_SUCCESS => Ok(flags),
-        CR_NO_SUCH_DEVNODE => Ok(0),
+        CR_NO_SUCH_DEVNODE => Ok(CM_DEVNODE_STATUS_FLAGS(0)),
         x => Err(Error::ConfigRet(x)),
     }
 }
@@ -156,7 +152,7 @@ unsafe fn device_instance_id(
 unsafe fn device_prop_sz(
     devinfo: HDEVINFO,
     devinfo_data: &SP_DEVINFO_DATA,
-    prop: u32,
+    prop: SETUP_DI_REGISTRY_PROPERTY,
 ) -> Result<String, Error> {
     let buflen = prop_bufsize(devinfo, devinfo_data, prop)?;
 
@@ -169,7 +165,7 @@ unsafe fn device_prop_sz(
 unsafe fn device_prop_multi_sz(
     devinfo: HDEVINFO,
     devinfo_data: &SP_DEVINFO_DATA,
-    prop: u32,
+    prop: SETUP_DI_REGISTRY_PROPERTY,
 ) -> Result<Vec<String>, Error> {
     let buflen = prop_bufsize(devinfo, devinfo_data, prop)?;
 
@@ -182,7 +178,7 @@ unsafe fn device_prop_multi_sz(
 unsafe fn prop_bufsize(
     devinfo: HDEVINFO,
     devinfo_data: &SP_DEVINFO_DATA,
-    prop: u32,
+    prop: SETUP_DI_REGISTRY_PROPERTY,
 ) -> Result<u32, Error> {
     let mut buflen = 0;
     // query buffer needed first - must return error
