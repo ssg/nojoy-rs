@@ -2,16 +2,18 @@
 ///
 /// Copyright (c) 2023 - Sedat Kapanoglu <sedat@kapanoglu.com>
 #[cfg(target_os = "windows")]
-use core::{mem::size_of, slice::from_raw_parts};
+use core::slice::from_raw_parts;
+use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+
+mod setupdienum;
 
 extern crate alloc;
-use alloc::ffi::CString;
 use windows::{
-    core::PCSTR,
+    core::PCWSTR,
     Win32::{
         Devices::{
             DeviceAndDriverInstallation::{
-                CM_Get_DevNode_Status, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsA, SetupDiGetDeviceInstanceIdA, SetupDiGetDeviceRegistryPropertyW, CM_DEVNODE_STATUS_FLAGS, CM_PROB, CONFIGRET, CR_NO_SUCH_DEVNODE, CR_SUCCESS, DIGCF_DEVICEINTERFACE, DN_DISABLEABLE, DN_STARTED, HDEVINFO, SETUP_DI_REGISTRY_PROPERTY, SPDRP_DEVICEDESC, SPDRP_HARDWAREID, SPDRP_MFG, SP_DEVINFO_DATA
+                CM_Disable_DevNode, CM_Enable_DevNode, CM_Get_DevNode_Status, SetupDiDestroyDeviceInfoList, SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW, SetupDiGetDeviceRegistryPropertyW, CM_DEVNODE_STATUS_FLAGS, CM_PROB, CONFIGRET, CR_NO_SUCH_DEVNODE, CR_SUCCESS, DIGCF_DEVICEINTERFACE, DN_DISABLEABLE, DN_STARTED, HDEVINFO, SETUP_DI_REGISTRY_PROPERTY, SPDRP_DEVICEDESC, SPDRP_HARDWAREID, SPDRP_MFG, SP_DEVINFO_DATA
             },
             HumanInterfaceDevice::HidD_GetHidGuid,
         },
@@ -28,6 +30,7 @@ pub enum GameControllerStatus {
 
 #[derive(Debug, Clone)]
 pub enum Error {
+    NotFound,
     Win32(windows::core::Error),
     ConfigRet(CONFIGRET),
 }
@@ -72,32 +75,67 @@ impl GameController {
     }
 }
 
-pub fn game_controllers() -> Result<Vec<GameController>, Error> {
-    let mut result = Vec::new();
-    let mut devinfo_data = SP_DEVINFO_DATA {
-        cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
-        ..Default::default()
-    };
-
+pub fn disable_device(id: &str) -> Result<(), Error> {
     unsafe {
-        let devinfo = dev_info(HidD_GetHidGuid())?;
-        let mut index = 0;
-        while SetupDiEnumDeviceInfo(devinfo, index, &mut devinfo_data).is_ok() {
-            index += 1;
-
-            let hwids = device_prop_multi_sz(devinfo, &devinfo_data, SPDRP_HARDWAREID)?;
-            if !is_game_controller(hwids) {
-                continue;
-            }
-
-            let controller = GameController::try_from_devinfo(devinfo, &devinfo_data)?;
-            result.push(controller);
+        let devinfo = devinfo_hid()?;
+        match devinfo_data(devinfo, id) {
+            Some(data) => {
+                let result = CM_Disable_DevNode(data.DevInst, 0);
+                if result != CR_SUCCESS {
+                    return Err(Error::ConfigRet(result).into());
+                }
+                return Ok(());
+            },
+            None => Err(Error::NotFound)
         }
+    }
+}
+
+unsafe fn devinfo_data(devinfo: HDEVINFO, id: &str) -> Option<SP_DEVINFO_DATA> {
+    let mut result = enum_game_controllers(devinfo).filter(|d| {
+        let instance_id = device_instance_id(devinfo, &d).ok();
+        instance_id.is_some_and(|i| i == id)
+    });
+    result.next()
+}
+
+pub fn enable_device(id: &str) -> Result<(), Error> {
+    unsafe {
+        let devinfo = devinfo_hid()?;
+        match devinfo_data(devinfo, id) {
+            Some(data) => {
+                let result = CM_Enable_DevNode(data.DevInst, 0);
+                if result != CR_SUCCESS {
+                    return Err(Error::ConfigRet(result).into());
+                }
+                return Ok(());
+            },
+            None => Err(Error::NotFound)
+        }
+    }
+}
+
+unsafe fn enum_game_controllers(devinfo: HDEVINFO) -> impl Iterator<Item = SP_DEVINFO_DATA> {
+    setupdienum::SetupDiEnum::new(devinfo).filter(move |d| {
+        device_prop_multi_sz(devinfo, &d, SPDRP_HARDWAREID).is_ok_and(|d| is_game_controller(d))
+    })
+}
+
+pub fn game_controllers() -> Result<Vec<GameController>, Error> {
+    unsafe {
+        let devinfo = devinfo_hid()?;
+        let result: Vec<GameController> = enum_game_controllers(devinfo)
+            .filter_map(|d| GameController::try_from_devinfo(devinfo, &d).ok())
+            .collect();
 
         // must do this at the end
         SetupDiDestroyDeviceInfoList(devinfo)?;
+        Ok(result)
     }
-    Ok(result)
+}
+
+unsafe fn devinfo_hid() -> Result<HDEVINFO, windows::core::Error> {
+    dev_info(HidD_GetHidGuid())
 }
 
 fn is_game_controller(hwids: Vec<String>) -> bool {
@@ -106,10 +144,11 @@ fn is_game_controller(hwids: Vec<String>) -> bool {
     hwids.iter().any(|s| s == GAME_CONTROLLER_HARDWARE_ID)
 }
 
+/// returns a HDEVINFO for given class GUID of a device
 unsafe fn dev_info(guid: windows::core::GUID) -> Result<HDEVINFO, windows::core::Error> {
-    SetupDiGetClassDevsA(
+    SetupDiGetClassDevsW(
         Some(&guid),
-        PCSTR::null(),
+        PCWSTR::null(),
         HWND::default(),
         DIGCF_DEVICEINTERFACE,
     )
@@ -133,20 +172,17 @@ unsafe fn device_instance_id(
 ) -> Result<String, Error> {
     let mut req_size = 0;
 
-    assert_insufficient_buffer(SetupDiGetDeviceInstanceIdA(
+    assert_insufficient_buffer(SetupDiGetDeviceInstanceIdW(
         devinfo,
         devinfo_data,
         None,
         Some(&mut req_size),
     ))?;
 
-    let mut buf = vec![0u8; req_size as usize];
-    SetupDiGetDeviceInstanceIdA(devinfo, devinfo_data, Some(&mut buf), Some(&mut req_size))?;
+    let mut buf = vec![0u16; req_size as usize];
+    SetupDiGetDeviceInstanceIdW(devinfo, devinfo_data, Some(&mut buf), Some(&mut req_size))?;
 
-    Ok(CString::from_vec_with_nul(buf)
-        .unwrap()
-        .into_string()
-        .unwrap())
+    Ok(OsString::from_wide(&buf).to_string_lossy().into_owned())
 }
 
 unsafe fn device_prop_sz(
@@ -175,6 +211,7 @@ unsafe fn device_prop_multi_sz(
     Ok(multi_sz_from_utf16_in_u8(&buf))
 }
 
+/// Query required buffer size
 unsafe fn prop_bufsize(
     devinfo: HDEVINFO,
     devinfo_data: &SP_DEVINFO_DATA,
